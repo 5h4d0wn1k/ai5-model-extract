@@ -28,8 +28,42 @@ python3 -c "import numpy; print('numpy available')"
 ## Usage
 
 ```bash
+# Offline demo (no API, no network) — black-box target is simulated locally, exit 0
 python3 model_extract.py
+
+# Tunable experiment
+python3 model_extract.py --features 10 --classes 4 --queries 5000 --seed 42
+
+# JSON report to reports/ (gitignored)
+python3 model_extract.py --output reports/ai5-report.json
+
+# Quiet CI mode + JSON
+python3 model_extract.py --quiet --output reports/ai5-report.json
 ```
+
+### Exit Codes
+
+- `0` — experiment completed cleanly
+- `1` — error (bad arguments / report write failure)
+
+### Live Lab Test Plan
+
+Runs entirely offline — the black-box target model, query budget, and surrogate
+are all generated locally; no external inference API is contacted.
+
+1. **Demo**: `python3 model_extract.py` — expect architecture inference, random/adaptive sampling extraction, boundary mapping, linear parameter estimation, and query-budget blocks. Exit `0`.
+2. **Accuracy transfer**: verify `accuracy_transfer.fidelity_adaptive_sampling` shows the surrogate agreeing with the target on held-out inputs, and compare `fidelity_random_sampling` for sampling-strategy effectiveness.
+3. **Budget discipline**: `query_budget.used <= query_budget.max_queries` always — extraction is throttled by the simulated budget.
+4. **JSON report**: `python3 model_extract.py --output reports/ai5-report.json` — verify `accuracy_transfer`, `query_budget`, `parameter_estimation` present.
+5. **Unit tests**: `python3 -m unittest discover -s tests -v` — all pass (target predict shapes, budget accounting, architecture inference fields, surrogate training, fidelity bounds, budget clamp on tight budgets, CLI JSON write).
+
+## Metrics
+
+- Real extraction code paths exercised offline: `TargetModel.query/query_confidence`, `QueryBudget.can_query/consume`, `ArchitectureInferrer.infer_by_probing/infer_nonlinearity`, `ModelExtractor.random_sampling/adaptive_sampling/boundary_mapping`, `SurrogateModel.forward/train/predict`, `ParameterEstimator.estimate_linear_params/compute_confidence`, `fidelity_score`
+- Metrics emitted: classes detected, mean confidence, scale sensitivity, estimated depth, nonlinearity; per-strategy fidelity (accuracy transfer); linear-fit accuracy/confidence; query budget used/remaining/ratio
+- Budget clamping hardened so extraction never exceeds `max_queries`
+- 8 unit tests; exit-code contract `0` clean / `1` error
+- Zero runtime cloud/network dependencies; offline demo needs only numpy
 
 ## Example Output
 

@@ -133,12 +133,16 @@ class ArchitectureInferrer:
         budget.consume(100)
 
         X2 = X * 2
+        if not budget.can_query(100):
+            return "unknown"
         preds2 = target.query(X2)
         budget.consume(100)
 
         linear_ratio = np.mean(preds1 == preds2)
 
         X3 = np.clip(X, 0, None)
+        if not budget.can_query(100):
+            return "unknown"
         preds3 = target.query(X3)
         budget.consume(100)
 
@@ -164,10 +168,11 @@ class ModelExtractor:
         self.query_log_y = []
 
     def random_sampling(self, n_samples=500):
-        X = np.random.randn(n_samples, self.n_features)
         if not self.budget.can_query(n_samples):
-            n_samples = self.budget.remaining()
-            X = np.random.randn(n_samples, self.n_features)
+            n_samples = max(0, self.budget.remaining())
+        if n_samples <= 0:
+            return np.array([]), np.array([])
+        X = np.random.randn(n_samples, self.n_features)
         y = self.target.query(X)
         self.budget.consume(n_samples)
         self.query_log_X.append(X)
@@ -175,6 +180,8 @@ class ModelExtractor:
         return X, y
 
     def adaptive_sampling(self, n_rounds=10, samples_per_round=50):
+        if not self.budget.can_query(samples_per_round):
+            return np.array([]), np.array([])
         X_all = np.random.randn(samples_per_round, self.n_features)
         y_all = self.target.query(X_all)
         self.budget.consume(samples_per_round)
@@ -415,81 +422,176 @@ def fidelity_score(target_model, surrogate_model, X_test):
     return np.mean(y_target == y_surrogate)
 
 
-def main():
-    print("=" * 60)
-    print("AI5 — Model Extraction Tool Demonstration")
-    print("=" * 60)
+def run_experiment(n_features: int = 10, n_classes: int = 4,
+                   max_queries: int = 5000, seed: int = 42,
+                   x_test_size: int = 200) -> dict:
+    """Run the full model extraction experiment, returning structured results."""
+    np.random.seed(seed)
+    budget = QueryBudget(max_queries=max_queries)
 
-    N_FEATURES = 10
-    N_CLASSES = 4
-    budget = QueryBudget(max_queries=5000)
-
-    target = TargetModel(input_size=N_FEATURES, num_classes=N_CLASSES)
-    X_test = np.random.randn(200, N_FEATURES)
+    target = TargetModel(input_size=n_features, num_classes=n_classes, seed=seed)
+    X_test = np.random.randn(x_test_size, n_features)
     y_test = target.query(X_test)
 
-    print(f"\n[1] Architecture inference (budget: {budget.remaining()})...")
     inferrer = ArchitectureInferrer()
-    arch_info = inferrer.infer_by_probing(target, N_FEATURES, N_CLASSES, budget)
-    print(f"    Classes detected: {arch_info['n_classes_detected']}")
-    print(f"    Mean confidence:  {arch_info['mean_confidence']:.4f}")
-    print(f"    Scale sensitivity: {arch_info['scale_sensitivity']:.4f}")
-    print(f"    Estimated depth:  {arch_info['estimated_depth']}")
-    print(f"    Budget remaining: {budget.remaining()}")
+    arch_info = inferrer.infer_by_probing(target, n_features, n_classes, budget)
+    activation = inferrer.infer_nonlinearity(target, n_features, budget)
 
-    activation = inferrer.infer_nonlinearity(target, N_FEATURES, budget)
-    print(f"    Nonlinearity:     {activation}")
+    extractor = ModelExtractor(target, n_features, n_classes, budget)
+    n_rand = max(0, min(500, budget.remaining()))
+    X_rand, y_rand = extractor.random_sampling(n_samples=n_rand)
 
-    print(f"\n[2] Random sampling extraction (budget: {budget.remaining()})...")
-    extractor = ModelExtractor(target, N_FEATURES, N_CLASSES, budget)
-    X_rand, y_rand = extractor.random_sampling(n_samples=500)
-    print(f"    Collected {len(X_rand)} samples")
-    print(f"    Budget remaining: {budget.remaining()}")
+    if len(X_rand) == 0:
+        fid_random = 0.0
+    else:
+        surr_random = SurrogateModel(n_features, n_classes)
+        surr_random.train(X_rand, y_rand, epochs=80)
+        fid_random = float(fidelity_score(target, surr_random, X_test))
 
-    surr_random = SurrogateModel(N_FEATURES, N_CLASSES)
-    surr_random.train(X_rand, y_rand, epochs=80)
-    fid_random = fidelity_score(target, surr_random, X_test)
-    print(f"    Fidelity (random): {fid_random:.4f}")
-
-    print(f"\n[3] Adaptive sampling extraction (budget: {budget.remaining()})...")
     X_adapt, y_adapt = extractor.adaptive_sampling(n_rounds=8, samples_per_round=50)
-    print(f"    Collected {len(X_adapt)} samples total")
-    print(f"    Budget remaining: {budget.remaining()}")
 
-    surr_adapt = SurrogateModel(N_FEATURES, N_CLASSES)
-    surr_adapt.train(X_adapt, y_adapt, epochs=80)
-    fid_adapt = fidelity_score(target, surr_adapt, X_test)
-    print(f"    Fidelity (adaptive): {fid_adapt:.4f}")
+    if len(X_adapt) == 0:
+        fid_adapt = 0.0
+    else:
+        surr_adapt = SurrogateModel(n_features, n_classes)
+        surr_adapt.train(X_adapt, y_adapt, epochs=80)
+        fid_adapt = float(fidelity_score(target, surr_adapt, X_test))
 
-    print(f"\n[4] Decision boundary mapping (budget: {budget.remaining()})...")
     X_boundary, y_boundary = extractor.boundary_mapping(n_directions=30)
-    print(f"    Boundary points mapped: {len(X_boundary)}")
-    print(f"    Budget remaining: {budget.remaining()}")
 
-    print(f"\n[5] Parameter estimation (linear fit)...")
-    estimator = ParameterEstimator(N_FEATURES, N_CLASSES)
-    W_est, b_est = estimator.estimate_linear_params(X_rand, y_rand)
-    print(f"    Weight matrix shape: {W_est.shape}")
-    print(f"    Bias shape: {b_est.shape}")
-    acc_est, conf_est = estimator.compute_confidence(X_test, y_test, W_est, b_est)
-    print(f"    Linear model accuracy: {acc_est:.4f}")
-    print(f"    Linear model confidence: {conf_est:.4f}")
+    estimator = ParameterEstimator(n_features, n_classes)
+    if len(X_rand) == 0:
+        W_est = np.zeros((n_features, n_classes))
+        b_est = np.zeros(n_classes)
+        acc_est = 0.0
+        conf_est = 0.0
+    else:
+        W_est, b_est = estimator.estimate_linear_params(X_rand, y_rand)
+        acc_est, conf_est = estimator.compute_confidence(X_test, y_test, W_est, b_est)
 
-    print(f"\n[6] Query budget summary...")
-    print(f"    Max queries:     {budget.max_queries}")
-    print(f"    Used queries:    {budget.used}")
-    print(f"    Remaining:       {budget.remaining()}")
-    print(f"    Usage ratio:     {budget.usage_ratio():.2%}")
+    return {
+        "target": {
+            "n_features": n_features,
+            "n_classes": n_classes,
+            "max_queries": max_queries,
+            "seed": seed,
+        },
+        "architecture_inference": {
+            **{k: v for k, v in arch_info.items()},
+            "nonlinearity": activation,
+        },
+        "extraction": {
+            "random_samples": int(len(X_rand)),
+            "adaptive_samples_total": int(len(X_adapt)),
+            "boundary_points_mapped": int(len(X_boundary)),
+        },
+        "accuracy_transfer": {
+            "fidelity_random_sampling": fid_random,
+            "fidelity_adaptive_sampling": fid_adapt,
+            "improvement": fid_adapt - fid_random,
+        },
+        "parameter_estimation": {
+            "linear_accuracy": float(acc_est),
+            "linear_confidence": float(conf_est),
+            "weight_matrix_shape": list(W_est.shape),
+            "bias_shape": list(b_est.shape),
+        },
+        "query_budget": {
+            "max_queries": budget.max_queries,
+            "used": budget.used,
+            "remaining": budget.remaining(),
+            "usage_ratio": float(budget.usage_ratio()),
+        },
+    }
 
-    print(f"\n[7] Fidelity comparison...")
-    print(f"    Random sampling:  {fid_random:.4f}")
-    print(f"    Adaptive sampling: {fid_adapt:.4f}")
-    print(f"    Improvement:      {fid_adapt - fid_random:+.4f}")
 
-    print("\n" + "=" * 60)
-    print("Demonstration complete.")
-    print("=" * 60)
+def format_report(results: dict) -> str:
+    lines = []
+    lines.append("=" * 60)
+    lines.append("AI5 — Model Extraction Tool Demonstration")
+    lines.append("=" * 60)
+    t = results["target"]
+    lines.append(f"\n[1] Architecture inference: {t['n_features']} features, "
+                 f"{t['n_classes']} classes")
+    ai = results["architecture_inference"]
+    lines.append(f"    Classes detected: {ai['n_classes_detected']}")
+    lines.append(f"    Mean confidence:  {ai['mean_confidence']:.4f}")
+    lines.append(f"    Scale sensitivity: {ai['scale_sensitivity']:.4f}")
+    lines.append(f"    Estimated depth:  {ai['estimated_depth']}")
+    lines.append(f"    Nonlinearity:     {ai['nonlinearity']}")
+
+    lines.append(f"\n[2] Random sampling extraction "
+                 f"(budget: {results['query_budget']['remaining']})...")
+    lines.append(f"    Collected {results['extraction']['random_samples']} samples")
+    lines.append(f"    Fidelity (random): "
+                 f"{results['accuracy_transfer']['fidelity_random_sampling']:.4f}")
+
+    lines.append(f"\n[3] Adaptive sampling extraction...")
+    lines.append(f"    Collected {results['extraction']['adaptive_samples_total']} samples")
+    lines.append(f"    Fidelity (adaptive): "
+                 f"{results['accuracy_transfer']['fidelity_adaptive_sampling']:.4f}")
+
+    lines.append(f"\n[4] Decision boundary mapping...")
+    lines.append(f"    Boundary points mapped: {results['extraction']['boundary_points_mapped']}")
+
+    lines.append(f"\n[5] Parameter estimation (linear fit)...")
+    pe = results["parameter_estimation"]
+    lines.append(f"    Linear model accuracy: {pe['linear_accuracy']:.4f}")
+    lines.append(f"    Linear model confidence: {pe['linear_confidence']:.4f}")
+
+    lines.append(f"\n[6] Query budget summary...")
+    qb = results["query_budget"]
+    lines.append(f"    Used queries:    {qb['used']}")
+    lines.append(f"    Remaining:       {qb['remaining']}")
+    lines.append(f"    Usage ratio:     {qb['usage_ratio']:.2%}")
+
+    lines.append(f"\n[7] Fidelity comparison...")
+    at = results["accuracy_transfer"]
+    lines.append(f"    Random sampling:  {at['fidelity_random_sampling']:.4f}")
+    lines.append(f"    Adaptive sampling: {at['fidelity_adaptive_sampling']:.4f}")
+    lines.append(f"    Improvement:      {at['improvement']:+.4f}")
+
+    lines.append("\n" + "=" * 60)
+    lines.append("Demonstration complete.")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    import argparse
+    import json
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="ai5-model-extract",
+        description="Query-based model extraction research: surrogate training, "
+                    "fidelity/accuracy transfer, architecture inference. "
+                    "Offline, self-contained.")
+    parser.add_argument("--features", type=int, default=10,
+                        help="input feature count")
+    parser.add_argument("--classes", type=int, default=4,
+                        help="target class count")
+    parser.add_argument("--queries", type=int, default=5000,
+                        help="query budget")
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed")
+    parser.add_argument("--output", metavar="FILE",
+                        help="write JSON report to FILE (e.g. reports/ai5-report.json)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress human-readable output")
+    args = parser.parse_args(argv)
+
+    results = run_experiment(n_features=args.features, n_classes=args.classes,
+                             max_queries=args.queries, seed=args.seed)
+
+    if args.output:
+        out_dir = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
+    if not args.quiet:
+        print(format_report(results))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

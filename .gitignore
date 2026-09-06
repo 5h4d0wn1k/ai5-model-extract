@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+reports/
+data/
+models/
+logs/
